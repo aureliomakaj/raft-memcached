@@ -1,5 +1,9 @@
 use rand::Rng;
-use std::{collections::HashMap, fs, thread, time};
+use std::{
+    collections::HashMap,
+    fs, thread,
+    time::{self, Duration},
+};
 
 use memcache::Client;
 
@@ -8,17 +12,21 @@ const FILENAME: &str = "large_file_test.pdf";
 
 fn main() {
     let servers = [
-        "memcache://172.17.0.2:11211?connect_timeout=2",
-        "memcache://172.17.0.3:11211?connect_timeout=2",
-        "memcache://172.17.0.4:11211?connect_timeout=2",
+        "memcache://172.18.0.2:11211?connect_timeout=2", //memcached1
+        "memcache://172.18.0.3:11211?connect_timeout=2", //memcached2
+        "memcache://172.18.0.4:11211?connect_timeout=2", //memcached3
     ];
+
+
+    // List of clients that are actually responding
     let mut clients: Vec<Client> = vec![];
 
     let now = time::Instant::now();
 
     for server in servers {
-        let res = memcache::connect(server);
-        let client = match res {
+        let connect_attempt = memcache::connect(server);
+
+        let client = match connect_attempt {
             Ok(client) => Some(client),
             Err(_) => {
                 println!("Server '{}' not reachable", server);
@@ -26,51 +34,46 @@ fn main() {
             }
         };
 
+        // Add client only if connected
         match client {
             Some(c) => clients.push(c),
             None => (),
         }
     }
 
-    println!("Number of clients: {}", clients.len());
-    let mut ok = false;
-    let mut i = 0;
-    let mut in_cache: String = String::from("");
-
-    while !ok && i < clients.len() {
-        let value_try: Option<String> = clients[i].get(CACHE_KEY).unwrap();
-        print_stats(&clients[i]);
-        match value_try {
-            Some(cached_value) => {
-                in_cache = Some(cached_value);
-                ok = true;
-            }
-            None => {
-                i += 1;
-            }
-        }
-        println!("Finished attempt: {}; Guard status: {}", i, ok);
+    println!("{} servers on {} are connected", clients.len(), servers.len());
+    let mut value: Option<String> = None;
+    if clients.len() > 0 {
+        let hashed_key = (clients[0].hash_function)(CACHE_KEY);
+        let index = (hashed_key as usize )% clients.len();
+        let trial = clients[index].get(CACHE_KEY);
+        value = match trial {
+            Ok(cached) => cached,
+            Err(_) => None
+        };
     }
 
-    if let None = in_cache {
-        let tmp = String::from("Hello");
-
-        let mut rng = rand::thread_rng();
-        let server_index = rng.gen_range(0..clients.len());
-
-        if !ok {
-            clients[server_index].set(CACHE_KEY, tmp, 3600).unwrap();
+    if let None = value {
+        let new_val = execute_long_query();
+        let hashed_key = (clients[0].hash_function)(CACHE_KEY);
+        let index = (hashed_key as usize )% clients.len();
+        let opt_res = clients[index].set(CACHE_KEY, &new_val, 600); // 5 minutes
+        match opt_res {
+            Ok(_) => (),
+            Err(_) => () 
         }
+        value = Some(new_val);
     }
 
-    println!("I got {} in {} seconds", value, now.elapsed().as_secs());
+    println!("I got {} in {} seconds", if let Some(x) = value {x} else { String::from("Nothing")}, now.elapsed().as_secs());
 }
 
 fn execute_long_query() -> String {
-    
+    thread::sleep(Duration::from_secs(30));
+    String::from("Here's your value")
 }
 
-/*fn read_file() -> HashMap<u8, u32> {
+fn read_file() -> HashMap<u8, u32> {
     let contents = fs::read(FILENAME).expect("Should have been able to read the file");
 
     let mut map: HashMap<u8, u32> = HashMap::from([]);
@@ -83,7 +86,7 @@ fn execute_long_query() -> String {
     }
 
     map
-}*/
+}
 
 fn print_stats(client: &Client) {
     let stats = client.stats().unwrap();
