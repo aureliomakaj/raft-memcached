@@ -1,9 +1,9 @@
 use rand::Rng;
 use core::panic;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::DefaultHasher},
     fs, thread,
-    time::{self, Duration}, cell::Cell,
+    time::{self, Duration}, cell::Cell, hash::{Hash, Hasher},
 };
 
 use memcache::Client;
@@ -33,88 +33,153 @@ impl ClientPool {
         }
     }
 
+    fn hash_function(key: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        return hasher.finish();
+    }
+
     fn add_server(&mut self, url: &str) {
-        (*self).servers.insert(url.to_string().clone(), false);
+        let server_key = url.to_string().clone();
         let connect_result = memcache::connect(url);
         match connect_result {
             Ok(c) => {
-                (*self).clients.push(c);
+                self.clients.push(c);
+                self.servers.insert(server_key, true);
                 self.active_clients.set(self.active_clients.get() + 1);
                 ()
             },
-            Err(_) => ()
+            Err(_) => {
+                self.servers.insert(server_key.clone(), false); 
+                ()
+            }
         }
     }
 
     fn get_active_clients(&self) -> u32 {
-        (*self).active_clients.get()
+        self.active_clients.get()
     }
 
-    fn get_connection(&self, key: &str) -> &Client {
-        let hashed_key = (self.clients[0].hash_function)(key);
-        let index = (hashed_key as usize) % self.get_active_clients() as usize;
-        &(self.clients[index])
+    fn get_index_from_key(&self, key: &str) -> usize {
+        let hashed_key = ClientPool::hash_function(key);
+        hashed_key as usize % (self.get_active_clients() as usize)
     }
 
-    fn get(&mut self, key: &str) -> Option<String> {
+    fn check_active_clients(&self) -> Option<u8>{
         if self.get_active_clients() == 0 {
             println!("No active clients");
             return None;
         }
+        Some(0)
+    }
 
-        let client = self.get_connection(key);
+    fn get_connection(&self, key: &str) -> Option<&Client> {
+        if let None = self.check_active_clients() {
+            return None;
+        }
+        Some(&(self.clients[self.get_index_from_key(key)]))
+    }
+
+    fn remove_client_from_key(&mut self, key: &str) {
+        let index = self.get_index_from_key(key);
+        self.active_clients.set(self.active_clients.get() - 1);
+        self.clients.swap_remove(index);
+        ()
+    }
+
+    fn get(&mut self, key: &str) -> Option<String> {
+
+        let client_opt = self.get_connection(key);
+        if let None = client_opt {
+            return None;
+        }
+
+        let client = client_opt.unwrap();
+
         let get_res = client.get(key);
 
         return match get_res {
             Ok(element) => element,
             Err(_) => {
+                self.remove_client_from_key(key);
                 None
             }
         }
     }
 
     fn set(&mut self, key: &str, value: String, expiration: u32) {
-        if self.get_active_clients() == 0 {
-            println!("No active clients");
+        let client_opt = self.get_connection(key);
+        if let None = client_opt {
             return ();
         }
-
-        let client = self.get_connection(key);
+        let client = client_opt.unwrap();
         let set_result = client.set(key, value, expiration);
         match set_result {
             Ok(_) => (),
-            Err(_) => ()
+            Err(_) => self.remove_client_from_key(key)
+        }
+    }
+
+    fn get_inactive_servers(&mut self) -> Vec<String> {
+        let mut collect = vec![];
+        for (server_url, value) in self.servers.iter() {
+            if !(*value) {
+                collect.push(server_url.clone());
+            }
+        }
+        collect
+    }
+
+    fn reconnect_unactive_servers (&mut self) {
+        for server in self.get_inactive_servers() {
+            self.add_server(server.as_str());
         }
     }
 
 }
 
 fn main() {
+    
     test2();
     
 }
 
 fn test2 () {
-    let now = time::Instant::now();
-
+    
+    print!("Starting setting up servers. . .");
     let mut pool = ClientPool::new();
     for server in SERVERS {
         pool.add_server(server);
     }
-    println!("Active servers: {}", pool.get_active_clients());
+
+    let mut iterations = 1;
+
+    loop {
+        println!("*** Starting iteration n° {}", iterations);
+        let now = time::Instant::now();
+        println!("Active servers: {}", pool.get_active_clients());
+        
+        let mut value = pool.get(CACHE_KEY);
+        if let None = value {
+            let tmp = execute_long_query();
+            pool.set(CACHE_KEY, tmp.clone(), 600);
+            value = Some(tmp);
+        }
     
-    let mut value = pool.get(CACHE_KEY);
-    if let None = value {
-        let tmp = execute_long_query();
-        pool.set(CACHE_KEY, tmp.clone(), 600);
-        value = Some(tmp);
+        println!(
+            "I got {} in {} seconds", if let Some(x) = value { x } else { String::from("Nothing") }, now.elapsed().as_secs()
+        );
+
+        println!("Trying to reconnect to inactive servers");
+        pool.reconnect_unactive_servers();
+        println!("Let me rest 5 seconds before next iteration");
+        thread::sleep(Duration::from_secs(5));
+        iterations += 1;
     }
 
-    println!(
-        "I got {} in {} seconds", if let Some(x) = value { x } else { String::from("Nothing") }, now.elapsed().as_secs()
-    );
 }
 
+#[allow(dead_code)]
 fn test1 () {
     // List of clients that are actually responding
     let mut clients: Vec<Client> = vec![];
@@ -172,10 +237,11 @@ fn test1 () {
 }
 
 fn execute_long_query() -> String {
-    thread::sleep(Duration::from_secs(30));
+    thread::sleep(Duration::from_secs(10));
     String::from("Here's your value")
 }
 
+#[allow(dead_code)]
 fn read_file() -> HashMap<u8, u32> {
     let contents = fs::read(FILENAME).expect("Should have been able to read the file");
 
@@ -191,6 +257,7 @@ fn read_file() -> HashMap<u8, u32> {
     map
 }
 
+#[allow(dead_code)]
 fn print_stats(client: &Client) {
     let stats = client.stats().unwrap();
     for (first, second) in stats.iter() {
