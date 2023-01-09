@@ -1,12 +1,10 @@
-use rand::Rng;
-use core::panic;
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     fs, thread,
     time::{self, Duration}, cell::Cell, hash::{Hash, Hasher},
 };
 
-use memcache::Client;
+use memcache::{Client, MemcacheError};
 
 const CACHE_KEY: &str = "temporary";
 const FILENAME: &str = "large_file_test.pdf";
@@ -17,10 +15,23 @@ const SERVERS: &[&str] = &[
     "memcache://172.18.0.4:11211?connect_timeout=2", //memcached3
 ];
 
+struct MyClient {
+    pub server_url: String,
+    client: Client,
+}
+
+impl MyClient {
+    pub fn get(&self, key: &str) -> Result<Option<String>, MemcacheError> {
+        self.client.get(key)
+    }
+
+    pub fn set(&self, key: &str, value: &str, expiration: u32) -> Result<(), MemcacheError> {
+        self.client.set(key, value, expiration)
+    }
+}
 struct ClientPool {
     servers: HashMap<String, bool>,
-    clients: Vec<Client>,
-    active_clients: Cell<u32>,
+    clients: Vec<MyClient>,
 }
 
 impl ClientPool {
@@ -29,7 +40,6 @@ impl ClientPool {
         ClientPool { 
             servers: HashMap::from([]), 
             clients: vec![], 
-            active_clients: Cell::new(0) 
         }
     }
 
@@ -40,41 +50,46 @@ impl ClientPool {
     }
 
     fn add_server(&mut self, url: &str) {
-        let server_key = url.to_string().clone();
         let connect_result = memcache::connect(url);
         match connect_result {
             Ok(c) => {
-                self.clients.push(c);
-                self.servers.insert(server_key, true);
-                self.active_clients.set(self.active_clients.get() + 1);
+                self.clients.push(
+                    MyClient {
+                        server_url: String::from(url),
+                        client: c
+                    }
+                );
+                self.servers.insert(String::from(url), true);
                 ()
             },
             Err(_) => {
-                self.servers.insert(server_key.clone(), false); 
+                self.servers.insert(String::from(url), false); 
                 ()
             }
         }
     }
 
-    fn get_active_clients(&self) -> u32 {
-        self.active_clients.get()
+    fn get_active_clients(&self) -> usize {
+        self.clients.len() 
     }
 
     fn get_index_from_key(&self, key: &str) -> usize {
         let hashed_key = ClientPool::hash_function(key);
-        hashed_key as usize % (self.get_active_clients() as usize)
+        let res = hashed_key as usize % self.get_active_clients();
+        println!("Key: '{}', index: {}", key, res);
+        res
     }
 
-    fn check_active_clients(&self) -> Option<u8>{
+    fn check_active_clients(&self) -> bool {
         if self.get_active_clients() == 0 {
             println!("No active clients");
-            return None;
+            return false;
         }
-        Some(0)
+        true
     }
 
-    fn get_connection(&self, key: &str) -> Option<&Client> {
-        if let None = self.check_active_clients() {
+    fn get_connection(&self, key: &str) -> Option<&MyClient> {
+        if !self.check_active_clients() {
             return None;
         }
         Some(&(self.clients[self.get_index_from_key(key)]))
@@ -82,8 +97,9 @@ impl ClientPool {
 
     fn remove_client_from_key(&mut self, key: &str) {
         let index = self.get_index_from_key(key);
-        self.active_clients.set(self.active_clients.get() - 1);
+        let server_url = self.get_connection(key).unwrap().server_url.clone();
         self.clients.swap_remove(index);
+        self.servers.insert(server_url, false);
         ()
     }
 
@@ -94,20 +110,21 @@ impl ClientPool {
             return None;
         }
 
-        let client = client_opt.unwrap();
+        let my_client = client_opt.unwrap();
 
-        let get_res = client.get(key);
+        let get_res = my_client.get(key);
 
         return match get_res {
             Ok(element) => element,
             Err(_) => {
                 self.remove_client_from_key(key);
-                None
+                // Retry get
+                self.get(key)
             }
         }
     }
 
-    fn set(&mut self, key: &str, value: String, expiration: u32) {
+    fn set(&mut self, key: &str, value: &str, expiration: u32) {
         let client_opt = self.get_connection(key);
         if let None = client_opt {
             return ();
@@ -116,7 +133,10 @@ impl ClientPool {
         let set_result = client.set(key, value, expiration);
         match set_result {
             Ok(_) => (),
-            Err(_) => self.remove_client_from_key(key)
+            Err(_) => {
+                self.remove_client_from_key(key);
+                self.set(key, value, expiration)
+            }
         }
     }
 
@@ -133,6 +153,13 @@ impl ClientPool {
     fn reconnect_unactive_servers (&mut self) {
         for server in self.get_inactive_servers() {
             self.add_server(server.as_str());
+        }
+    }
+
+    fn print_current_state(&self) {
+        println!("Printing current state");
+        for (key, value) in self.servers.iter() {
+            println!("Server '{}': {}", key, value);
         }
     }
 
@@ -162,7 +189,7 @@ fn test2 () {
         let mut value = pool.get(CACHE_KEY);
         if let None = value {
             let tmp = execute_long_query();
-            pool.set(CACHE_KEY, tmp.clone(), 600);
+            pool.set(CACHE_KEY, &tmp, 600);
             value = Some(tmp);
         }
     
@@ -170,6 +197,7 @@ fn test2 () {
             "I got {} in {} seconds", if let Some(x) = value { x } else { String::from("Nothing") }, now.elapsed().as_secs()
         );
 
+        pool.print_current_state();
         println!("Trying to reconnect to inactive servers");
         pool.reconnect_unactive_servers();
         println!("Let me rest 5 seconds before next iteration");
