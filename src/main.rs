@@ -1,13 +1,18 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     fs, thread,
-    time::{self, Duration}, cell::Cell, hash::{Hash, Hasher},
+    time::{self, Duration}, hash::{Hash, Hasher},
+    io::Cursor
 };
 
+use async_raft::{AppData, AppDataResponse, NodeId, RaftStorage, raft::{MembershipConfig, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse, EntryPayload}, async_trait::async_trait, RaftNetwork, Raft, storage::InitialState};
 use memcache::{Client, MemcacheError};
+use serde::{Serialize, Deserialize};
+use anyhow::Result as AnyHowResult;
 
-const CACHE_KEY: &str = "temporary";
-const FILENAME: &str = "large_file_test.pdf";
+
+//const CACHE_KEY: &str = "temporary";
+//const FILENAME: &str = "large_file_test.pdf";
 
 const SERVERS: &[&str] = &[
     "memcache://172.18.0.2:11211?connect_timeout=2", //memcached1
@@ -15,24 +20,105 @@ const SERVERS: &[&str] = &[
     "memcache://172.18.0.4:11211?connect_timeout=2", //memcached3
 ];
 
-struct MyClient {
-    pub server_url: String,
-    client: Client,
+// This is the application data request used by Memrafted.
+// It contains the minimum fields necessary to store information
+// in the memcached server
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientRequest {
+    key: String,
+    value: String,
+    expiration: u32
 }
 
-impl MyClient {
-    pub fn get(&self, key: &str) -> Result<Option<String>, MemcacheError> {
-        self.client.get(key)
+impl AppData for ClientRequest {}
+
+// This struct represents the response, which for the current moment
+// is only a String. 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientResponse(Result<Option<String>, MemcacheError>);
+
+impl AppDataResponse for ClientResponse {}
+
+/// A type which emulates a network transport and implements the `RaftNetwork` trait.
+pub struct RaftRouter {
+    // ... some internal state ...
+}
+
+#[async_trait]
+impl RaftNetwork<ClientRequest> for RaftRouter {
+    /// Send an AppendEntries RPC to the target Raft node (§5).
+    async fn append_entries(&self, target: u64, rpc: AppendEntriesRequest<ClientRequest>) -> AnyHowResult<AppendEntriesResponse> {
+        // ... snip ...
     }
 
-    pub fn set(&self, key: &str, value: &str, expiration: u32) -> Result<(), MemcacheError> {
-        self.client.set(key, value, expiration)
+    /// Send an InstallSnapshot RPC to the target Raft node (§7).
+    async fn install_snapshot(&self, target: u64, rpc: InstallSnapshotRequest) -> AnyHowResult<InstallSnapshotResponse> {
+        // ... snip ...
+    }
+
+    /// Send a RequestVote RPC to the target Raft node (§5).
+    async fn vote(&self, target: u64, rpc: VoteRequest) -> AnyHowResult<VoteResponse> {
+        // ... snip ...
     }
 }
+
+pub struct MemStore {
+    id: NodeId,
+    server_url: String,
+    client: Option<Client>,
+    log: HashMap<String, ClientRequest>
+}
+
+#[async_trait]
+impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
+    type Snapshot = Cursor<Vec<u8>>;
+    type ShutdownError = ShutdownError;
+
+    async fn get_membership_config(&self) -> AnyHowResult<MembershipConfig> {
+        Ok(MembershipConfig::new_initial(self.id))
+    }
+
+    async fn get_initial_state(&self) -> AnyHowResult<InitialState> {
+        let new = InitialState::new_initial(self.id);
+        Ok(new)
+    }
+
+}
+
+
+pub type MemRaft = Raft<ClientRequest, ClientResponse, RaftRouter, MemStore>;
+
+fn main() {
+
+}
+
+
+/*impl Memrafted {
+
+    pub fn is_active(&self) -> bool {
+        match self.client {
+            Some(_) => true,
+            None => false
+        }
+    }
+
+    pub  fn get(&self, key: &str) -> Option<String> {
+        None
+    }
+
+    pub  fn set(&self, key: &str, value: &str, expiration: u32)  {
+        //self.client.set(key, value, expiration)
+    }
+}*/
+
+/*
 struct ClientPool {
     servers: HashMap<String, bool>,
-    clients: Vec<MyClient>,
+    clients: Vec<MemraftedClient>,
 }
+
+
+
 
 impl ClientPool {
     
@@ -54,7 +140,7 @@ impl ClientPool {
         match connect_result {
             Ok(c) => {
                 self.clients.push(
-                    MyClient {
+                    MemraftedClient {
                         server_url: String::from(url),
                         client: c
                     }
@@ -88,7 +174,7 @@ impl ClientPool {
         true
     }
 
-    fn get_connection(&self, key: &str) -> Option<&MyClient> {
+    fn get_connection(&self, key: &str) -> Option<&MemraftedClient> {
         if !self.check_active_clients() {
             return None;
         }
@@ -164,6 +250,11 @@ impl ClientPool {
     }
 
 }
+
+
+
+
+
 
 fn main() {
     
@@ -293,3 +384,4 @@ fn print_stats(client: &Client) {
         println!("Curr_items: {}", second.get("curr_items").unwrap());
     }
 }
+*/
