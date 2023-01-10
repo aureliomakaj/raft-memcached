@@ -1,15 +1,31 @@
+use core::fmt;
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
-    fs, thread,
-    time::{self, Duration}, hash::{Hash, Hasher},
-    io::Cursor
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
+    fs,
+    hash::{Hash, Hasher},
+    io::Cursor,
+    thread,
+    time::{self, Duration},
 };
 
-use async_raft::{AppData, AppDataResponse, NodeId, RaftStorage, raft::{MembershipConfig, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse, EntryPayload}, async_trait::async_trait, RaftNetwork, Raft, storage::InitialState};
-use memcache::{Client, MemcacheError};
-use serde::{Serialize, Deserialize};
-use anyhow::Result as AnyHowResult;
+use std::error::Error;
 
+use anyhow::Result as AnyHowResult;
+use async_raft::{
+    async_trait::async_trait,
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, Entry, EntryPayload, InstallSnapshotRequest,
+        InstallSnapshotResponse, MembershipConfig, VoteRequest, VoteResponse,
+    },
+    storage::{CurrentSnapshotData, HardState, InitialState},
+    AppData, AppDataResponse, NodeId, Raft, RaftNetwork, RaftStorage,
+};
+use memcache::{Client, MemcacheError};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
+
+//use thiserror::Error;
 
 //const CACHE_KEY: &str = "temporary";
 //const FILENAME: &str = "large_file_test.pdf";
@@ -20,6 +36,24 @@ const SERVERS: &[&str] = &[
     "memcache://172.18.0.4:11211?connect_timeout=2", //memcached3
 ];
 
+#[derive(Debug, Clone)]
+struct ShutdownError;
+
+// Generation of an error is completely separate from how it is displayed.
+// There's no need to be concerned about cluttering complex logic with the display style.
+//
+// Note that we don't store any extra info about the errors. This means we can't state
+// which string failed to parse without modifying our types to carry that information.
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Error. Shutting down")
+    }
+}
+
+impl Error for ShutdownError {}
+
+//impl StdError
+
 // This is the application data request used by Memrafted.
 // It contains the minimum fields necessary to store information
 // in the memcached server
@@ -27,46 +61,69 @@ const SERVERS: &[&str] = &[
 struct ClientRequest {
     key: String,
     value: String,
-    expiration: u32
+    expiration: u32,
 }
 
 impl AppData for ClientRequest {}
 
 // This struct represents the response, which for the current moment
-// is only a String. 
+// is only a String.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClientResponse(Result<Option<String>, MemcacheError>);
+pub struct ClientResponse(Option<String>);
 
 impl AppDataResponse for ClientResponse {}
 
 /// A type which emulates a network transport and implements the `RaftNetwork` trait.
-pub struct RaftRouter {
+/*pub struct RaftRouter {
     // ... some internal state ...
 }
 
 #[async_trait]
 impl RaftNetwork<ClientRequest> for RaftRouter {
-    /// Send an AppendEntries RPC to the target Raft node (§5).
+    // Send an AppendEntries RPC to the target Raft node (§5).
     async fn append_entries(&self, target: u64, rpc: AppendEntriesRequest<ClientRequest>) -> AnyHowResult<AppendEntriesResponse> {
         // ... snip ...
     }
 
-    /// Send an InstallSnapshot RPC to the target Raft node (§7).
+    // Send an InstallSnapshot RPC to the target Raft node (§7).
     async fn install_snapshot(&self, target: u64, rpc: InstallSnapshotRequest) -> AnyHowResult<InstallSnapshotResponse> {
         // ... snip ...
     }
 
-    /// Send a RequestVote RPC to the target Raft node (§5).
+    // Send a RequestVote RPC to the target Raft node (§5).
     async fn vote(&self, target: u64, rpc: VoteRequest) -> AnyHowResult<VoteResponse> {
-        // ... snip ...
+        //  ... snip ...
     }
-}
+}*/
 
 pub struct MemStore {
     id: NodeId,
+    // Server url
     server_url: String,
-    client: Option<Client>,
-    log: HashMap<String, ClientRequest>
+    // Client for communicaiton with Memcached server
+    client: RwLock<Option<Client>>,
+    // Set of logs. Each command is a mutation of the state, mapped to a term.
+    // RwLock is an asynchronous reader-writer lock, at most one writer at any point in time
+    log: RwLock<BTreeMap<u64, Entry<ClientRequest>>>,
+
+    last_applied_log: RwLock<u64>,
+}
+
+impl MemStore {
+    pub fn new(id: NodeId, url: String) -> Self {
+        let client_res = memcache::connect(url.clone());
+        let client = match client_res {
+            Ok(c) => Some(c),
+            Err(_) => None,
+        };
+        Self {
+            id,
+            server_url: url,
+            client: RwLock::new(client),
+            log: RwLock::new(BTreeMap::new()),
+            last_applied_log: RwLock::new(0)
+        }
+    }
 }
 
 #[async_trait]
@@ -75,7 +132,16 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
     type ShutdownError = ShutdownError;
 
     async fn get_membership_config(&self) -> AnyHowResult<MembershipConfig> {
-        Ok(MembershipConfig::new_initial(self.id))
+        let log = self.log.read().await;
+        let cfg_opt = log.values().rev().find_map(|entry| match &entry.payload {
+            EntryPayload::ConfigChange(cfg) => Some(cfg.membership.clone()),
+            EntryPayload::SnapshotPointer(snap) => Some(snap.membership.clone()),
+            _ => None,
+        });
+        Ok(match cfg_opt {
+            Some(cfg) => cfg,
+            None => MembershipConfig::new_initial(self.id),
+        })
     }
 
     async fn get_initial_state(&self) -> AnyHowResult<InitialState> {
@@ -83,15 +149,101 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
         Ok(new)
     }
 
+    async fn save_hard_state(&self, hs: &HardState) -> AnyHowResult<()> {
+        //*self.hs.write().await = Some(hs.clone());
+        Ok(())
+    }
+
+    async fn get_log_entries(&self, start: u64, stop: u64) -> AnyHowResult<Vec<Entry<ClientRequest>>> {
+        // Invalid request, return empty vec.
+        if start > stop {
+            //tracing::error!("invalid request, start > stop");
+            return Ok(vec![]);
+        }
+        let log = self.log.read().await;
+        Ok(log.range(start..stop).map(|(_, val)| val.clone()).collect())
+    }
+
+    async fn delete_logs_from(&self, start: u64, stop: Option<u64>) -> AnyHowResult<()> {
+        if stop.as_ref().map(|stop| &start > stop).unwrap_or(false) {
+            //tracing::error!("invalid request, start > stop");
+            return Ok(());
+        }
+        let mut log = self.log.write().await;
+
+        // If a stop point was specified, delete from start until the given stop point.
+        if let Some(stop) = stop.as_ref() {
+            for key in start..*stop {
+                log.remove(&key);
+            }
+            return Ok(());
+        }
+        // Else, just split off the remainder.
+        log.split_off(&start);
+        Ok(())
+    }
+
+    async fn append_entry_to_log(&self, entry: &Entry<ClientRequest>) -> AnyHowResult<()> {
+        let mut log = self.log.write().await;
+        log.insert(entry.index, entry.clone());
+        Ok(())
+    }
+
+    async fn replicate_to_log(&self, entries: &[Entry<ClientRequest>]) -> AnyHowResult<()> {
+        let mut log = self.log.write().await;
+        for entry in entries {
+            log.insert(entry.index, entry.clone());
+        }
+        Ok(())
+    }    
+
+    async fn apply_entry_to_state_machine(&self, index: &u64, data: &ClientRequest) -> AnyHowResult<ClientResponse> {
+        // To make the call to Memcached
+        
+        Ok(ClientResponse(None))
+    }
+
+    async fn replicate_to_state_machine(&self, entries: &[(&u64, &ClientRequest)]) -> AnyHowResult<()> {
+        // let mut sm = self.sm.write().await;
+        // for (index, data) in entries {
+        //     sm.last_applied_log = **index;
+        //     if let Some((serial, _)) = sm.client_serial_responses.get(&data.client) {
+        //         if serial == &data.serial {
+        //             continue;
+        //         }
+        //     }
+        //     let previous = sm.client_status.insert(data.client.clone(), data.status.clone());
+        //     sm.client_serial_responses.insert(data.client.clone(), (data.serial, previous.clone()));
+        // }
+        Ok(())
+    }
+
+    async fn do_log_compaction(&self) -> AnyHowResult<CurrentSnapshotData<Self::Snapshot>> {
+        todo!()
+    }
+
+    async fn create_snapshot(&self) -> AnyHowResult<(String, Box<Self::Snapshot>)> {
+        todo!()
+    }
+
+    async fn finalize_snapshot_installation(
+        &self, index: u64, term: u64, delete_through: Option<u64>, id: String, snapshot: Box<Self::Snapshot>,
+    ) -> AnyHowResult<()> {
+        
+        Ok(())
+    }
+
+    async fn get_current_snapshot(&self) -> AnyHowResult<Option<CurrentSnapshotData<Self::Snapshot>>> {
+        todo!()
+    }
+
+
+
 }
 
+//pub type MemRaft = Raft<ClientRequest, ClientResponse, RaftRouter, MemStore>;
 
-pub type MemRaft = Raft<ClientRequest, ClientResponse, RaftRouter, MemStore>;
-
-fn main() {
-
-}
-
+fn main() {}
 
 /*impl Memrafted {
 
@@ -109,9 +261,9 @@ fn main() {
     pub  fn set(&self, key: &str, value: &str, expiration: u32)  {
         //self.client.set(key, value, expiration)
     }
-}*/
+}
 
-/*
+
 struct ClientPool {
     servers: HashMap<String, bool>,
     clients: Vec<MemraftedClient>,
@@ -121,11 +273,11 @@ struct ClientPool {
 
 
 impl ClientPool {
-    
+
     fn new () -> ClientPool {
-        ClientPool { 
-            servers: HashMap::from([]), 
-            clients: vec![], 
+        ClientPool {
+            servers: HashMap::from([]),
+            clients: vec![],
         }
     }
 
@@ -149,14 +301,14 @@ impl ClientPool {
                 ()
             },
             Err(_) => {
-                self.servers.insert(String::from(url), false); 
+                self.servers.insert(String::from(url), false);
                 ()
             }
         }
     }
 
     fn get_active_clients(&self) -> usize {
-        self.clients.len() 
+        self.clients.len()
     }
 
     fn get_index_from_key(&self, key: &str) -> usize {
@@ -257,13 +409,13 @@ impl ClientPool {
 
 
 fn main() {
-    
+
     test2();
-    
+
 }
 
 fn test2 () {
-    
+
     print!("Starting setting up servers. . .");
     let mut pool = ClientPool::new();
     for server in SERVERS {
@@ -276,14 +428,14 @@ fn test2 () {
         println!("*** Starting iteration n° {}", iterations);
         let now = time::Instant::now();
         println!("Active servers: {}", pool.get_active_clients());
-        
+
         let mut value = pool.get(CACHE_KEY);
         if let None = value {
             let tmp = execute_long_query();
             pool.set(CACHE_KEY, &tmp, 600);
             value = Some(tmp);
         }
-    
+
         println!(
             "I got {} in {} seconds", if let Some(x) = value { x } else { String::from("Nothing") }, now.elapsed().as_secs()
         );
